@@ -1,0 +1,82 @@
+{
+  "benchmark_timestamp": "2026-10-25T09:19:58Z",
+  "sample_size": 20,
+  "scenarios": [
+    {
+      "scenario": "Sequential (1dl / 1up, Ref-Send OFF)",
+      "dl_concurrency": 1,
+      "up_concurrency": 1,
+      "reference_send_enabled": false,
+      "files_processed": 20,
+      "total_megabytes": 118.0,
+      "elapsed_seconds": 1.278,
+      "files_per_minute": 938.9,
+      "overall_mb_s": 92.33,
+      "median_download_mb_s": 95.97,
+      "p90_download_mb_s": 98.54,
+      "median_upload_mb_s": 18523.89,
+      "p90_upload_mb_s": 41836.09,
+      "method_counts": {
+        "reference-send": 0,
+        "re-upload": 20
+      }
+    },
+    {
+      "scenario": "Pipelined (2dl / 1up, Ref-Send OFF)",
+      "dl_concurrency": 2,
+      "up_concurrency": 1,
+      "reference_send_enabled": false,
+      "files_processed": 20,
+      "total_megabytes": 118.0,
+      "elapsed_seconds": 0.668,
+      "files_per_minute": 1797.3,
+      "overall_mb_s": 176.73,
+      "median_download_mb_s": 96.47,
+      "p90_download_mb_s": 99.3,
+      "median_upload_mb_s": 16532.35,
+      "p90_upload_mb_s": 58287.77,
+      "method_counts": {
+        "reference-send": 0,
+        "re-upload": 20
+      }
+    },
+    {
+      "scenario": "Pipelined (3dl / 1up, Ref-Send OFF)",
+      "dl_concurrency": 3,
+      "up_concurrency": 1,
+      "reference_send_enabled": false,
+      "files_processed": 20,
+      "total_megabytes": 118.0,
+      "elapsed_seconds": 0.473,
+      "files_per_minute": 2538.84,
+      "overall_mb_s": 249.65,
+      "median_download_mb_s": 95.88,
+      "p90_download_mb_s": 99.06,
+      "median_upload_mb_s": 11935.52,
+      "p90_upload_mb_s": 101522.83,
+      "method_counts": {
+        "reference-send": 0,
+        "re-upload": 20
+      }
+    },
+    {
+      "scenario": "Fast Path (2dl / 1up, Ref-Send ON)",
+      "dl_concurrency": 2,
+      "up_concurrency": 1,
+      "reference_send_enabled": true,
+      "files_processed": 20,
+      "total_megabytes": 118.0,
+      "elapsed_seconds": 0.123,
+      "files_per_minute": 9770.78,
+      "overall_mb_s": 960.79,
+      "median_download_mb_s": 0.0,
+      "p90_download_mb_s": 0.0,
+      "median_upload_mb_s": 430.47,
+      "p90_upload_mb_s": 1338.16,
+      "method_counts": {
+        "reference-send": 20,
+        "re-upload": 0
+      }
+    }
+  ]
+}

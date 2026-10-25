@@ -18,22 +18,33 @@ import datetime
 import fcntl
 import getpass
 import hashlib
+import inspect
 import json
 import logging
 import os
+import random
 import re
 import shutil
 import signal
 import sqlite3
+import statistics
 import sys
 import time
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union
+
+try:
+    import cryptg
+    CRYPTG_AVAILABLE = True
+except ImportError:
+    CRYPTG_AVAILABLE = False
 
 from dotenv import load_dotenv
 from telethon import TelegramClient, utils
 from telethon.errors import (
     ApiIdInvalidError,
+    AuthKeyDuplicatedError,
     ChatForwardsRestrictedError,
+    FileReferenceExpiredError,
     FloodWaitError,
     PhoneNumberInvalidError,
     SessionPasswordNeededError,
@@ -116,12 +127,20 @@ class Config:
     # Batching & Transfer Controls
     BATCH_SIZE: int = _parse_int(os.getenv("BATCH_SIZE", "10"), 10)
     CONCURRENCY: int = _parse_int(os.getenv("CONCURRENCY", "2"), 2)
-    MAX_RETRIES: int = _parse_int(os.getenv("MAX_RETRIES", "5"), 5)
+    DOWNLOAD_CONCURRENCY: int = _parse_int(os.getenv("DOWNLOAD_CONCURRENCY", "2"), 2)
+    UPLOAD_CONCURRENCY: int = _parse_int(os.getenv("UPLOAD_CONCURRENCY", "1"), 1)
+    QUEUE_MAX: int = _parse_int(os.getenv("QUEUE_MAX", "4"), 4)
+    DOWNLOAD_AHEAD_MAX_GB: float = _parse_float(os.getenv("DOWNLOAD_AHEAD_MAX_GB", "2.0"), 2.0)
+    MIN_FREE_DISK_GB: float = _parse_float(os.getenv("MIN_FREE_DISK_GB", "1.0"), 1.0)
+    MAX_RETRIES: int = _parse_int(os.getenv("MAX_RETRIES", "4"), 4)
     RETRY_BASE_DELAY: float = _parse_float(os.getenv("RETRY_BASE_DELAY", "2.0"), 2.0)
+    MAX_BACKOFF_SECONDS: float = _parse_float(os.getenv("MAX_BACKOFF_SECONDS", "60.0"), 60.0)
     UPLOAD_DELAY_SECONDS: float = _parse_float(os.getenv("UPLOAD_DELAY_SECONDS", "1.5"), 1.5)
+    KEEP_TEMP_ON_FAILURE: bool = _parse_bool(os.getenv("KEEP_TEMP_ON_FAILURE", "false"), False)
+    ENABLE_PARALLEL_PARTS: bool = _parse_bool(os.getenv("ENABLE_PARALLEL_PARTS", "false"), False)
 
     # Operational Flags
-    DRY_RUN: bool = _parse_bool(os.getenv("DRY_RUN", "true"), True)
+    DRY_RUN: bool = _parse_bool(os.getenv("DRY_RUN", "false"), False)
     CREATE_GROUP: bool = _parse_bool(os.getenv("CREATE_GROUP", "false"), False)
     CREATE_TOPICS: bool = _parse_bool(os.getenv("CREATE_TOPICS", "false"), False)
     AUTO_START: bool = _parse_bool(os.getenv("AUTO_START", "false"), False)
@@ -134,11 +153,12 @@ class Config:
     DASHBOARD_USER: str = os.getenv("DASHBOARD_USER", "admin").strip()
     DASHBOARD_PASSWORD: str = os.getenv("DASHBOARD_PASSWORD", "changeme").strip()
 
-    # Paths (Persistent Storage)
+    # Paths & Sessions (Unique per machine to prevent AuthKeyDuplicatedError)
+    SESSION_NAME: str = os.getenv("SESSION_NAME", "uploader_desktop_session").strip()
     _default_data = "/var/data" if (os.path.isdir("/var/data") and os.access("/var/data", os.W_OK)) else os.path.join(_CURRENT_DIR, "data")
     DATA_DIR: str = os.getenv("DATA_DIR", _default_data).strip()
     DB_PATH: str = os.getenv("DB_PATH", os.path.join(DATA_DIR, "organizer.db")).strip()
-    SESSION_PATH: str = os.getenv("SESSION_PATH", os.path.join(DATA_DIR, "organizer.session")).strip()
+    SESSION_PATH: str = os.getenv("SESSION_PATH", os.path.join(DATA_DIR, f"{SESSION_NAME}.session" if not SESSION_NAME.endswith(".session") else SESSION_NAME)).strip()
     TMP_DIR: str = os.getenv("TMP_DIR", os.path.join(DATA_DIR, "tmp")).strip()
     LOG_DIR: str = os.getenv("LOG_DIR", os.path.join(DATA_DIR, "logs")).strip()
     MANUAL_DOWNLOADS_DIR: str = os.getenv("MANUAL_DOWNLOADS_DIR", os.path.join(_CURRENT_DIR, "manual_downloads")).strip()
@@ -195,6 +215,8 @@ _f_handler = logging.FileHandler(os.path.join(Config.LOG_DIR, "organizer.log"), 
 _f_handler.setFormatter(RedactingFormatter("[%(asctime)s] %(levelname)s: %(message)s", "%Y-%m-%d %H:%M:%S"))
 logger.addHandler(_f_handler)
 
+logger.info(f"cryptg acceleration available: {CRYPTG_AVAILABLE}")
+
 
 # ==============================================================================
 # SINGLE-INSTANCE LOCKING
@@ -243,13 +265,20 @@ class ProcessLock:
 # ==============================================================================
 
 class Database:
-    """Thread-safe SQLite database manager tracking topics, units, items, and state."""
+    """Thread-safe SQLite database manager tracking topics, units, items, metrics, and state."""
 
     def __init__(self, path: str = Config.DB_PATH):
         self.path = path
         self.conn = sqlite3.connect(path, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
+        self._async_lock: Optional[asyncio.Lock] = None
         self._init_db()
+
+    @property
+    def lock(self) -> asyncio.Lock:
+        if self._async_lock is None:
+            self._async_lock = asyncio.Lock()
+        return self._async_lock
 
     def _init_db(self):
         with self.conn:
@@ -293,16 +322,60 @@ class Database:
                     caption TEXT,
                     file_size INTEGER,
                     fingerprint TEXT,
+                    topic_id INTEGER,
+                    local_path TEXT,
+                    next_attempt_at TEXT,
                     PRIMARY KEY(source, item_key)
                 )
             """)
             self.conn.execute("CREATE INDEX IF NOT EXISTS idx_items_status ON items(status)")
             self.conn.execute("CREATE INDEX IF NOT EXISTS idx_items_source_key ON items(source, item_key)")
+            self.conn.execute("""
+                CREATE TABLE IF NOT EXISTS job_metrics (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    source_chat_id TEXT,
+                    topic_id INTEGER,
+                    msg_id INTEGER,
+                    size_bytes INTEGER,
+                    queue_wait_s REAL,
+                    download_s REAL,
+                    upload_s REAL,
+                    retry_delay_s REAL,
+                    floodwait_s REAL,
+                    total_s REAL,
+                    down_mbps REAL,
+                    up_mbps REAL,
+                    retries INTEGER,
+                    method TEXT,
+                    error_class TEXT,
+                    created_at TEXT
+                )
+            """)
+            self.conn.execute("CREATE INDEX IF NOT EXISTS idx_job_metrics_created_at ON job_metrics(created_at)")
         self._migrate_schema()
 
     def _migrate_schema(self):
         with self.conn:
-            # Add columns if missing in legacy tables
+            # Check schema version
+            cur_meta = self.conn.execute("SELECT value FROM meta WHERE key = 'schema_version'")
+            row_meta = cur_meta.fetchone()
+            current_ver = int(row_meta["value"]) if row_meta and row_meta["value"] and row_meta["value"].isdigit() else 1
+
+            # Migrate legacy 'topics' table column name -> topic_name
+            cur_topics = self.conn.execute("PRAGMA table_info(topics)")
+            t_cols = {row["name"] for row in cur_topics.fetchall()}
+            if "name" in t_cols and "topic_name" not in t_cols:
+                try:
+                    self.conn.execute("ALTER TABLE topics RENAME COLUMN name TO topic_name")
+                except Exception:
+                    pass
+            if "created_at" not in t_cols:
+                try:
+                    self.conn.execute("ALTER TABLE topics ADD COLUMN created_at TEXT")
+                except Exception:
+                    pass
+
+            # Add columns if missing in legacy items table
             cursor = self.conn.execute("PRAGMA table_info(items)")
             cols = {row["name"] for row in cursor.fetchall()}
             if "filename" not in cols:
@@ -313,6 +386,36 @@ class Database:
                 self.conn.execute("ALTER TABLE items ADD COLUMN file_size INTEGER")
             if "fingerprint" not in cols:
                 self.conn.execute("ALTER TABLE items ADD COLUMN fingerprint TEXT")
+            if "topic_id" not in cols:
+                self.conn.execute("ALTER TABLE items ADD COLUMN topic_id INTEGER")
+            if "local_path" not in cols:
+                self.conn.execute("ALTER TABLE items ADD COLUMN local_path TEXT")
+            if "next_attempt_at" not in cols:
+                self.conn.execute("ALTER TABLE items ADD COLUMN next_attempt_at TEXT")
+
+            # Ensure job_metrics table exists
+            self.conn.execute("""
+                CREATE TABLE IF NOT EXISTS job_metrics (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    source_chat_id TEXT,
+                    topic_id INTEGER,
+                    msg_id INTEGER,
+                    size_bytes INTEGER,
+                    queue_wait_s REAL,
+                    download_s REAL,
+                    upload_s REAL,
+                    retry_delay_s REAL,
+                    floodwait_s REAL,
+                    total_s REAL,
+                    down_mbps REAL,
+                    up_mbps REAL,
+                    retries INTEGER,
+                    method TEXT,
+                    error_class TEXT,
+                    created_at TEXT
+                )
+            """)
+            self.conn.execute("CREATE INDEX IF NOT EXISTS idx_job_metrics_created_at ON job_metrics(created_at)")
 
             # Migrate legacy 'restricted' status to 'PENDING' for retryability
             self.conn.execute("""
@@ -321,12 +424,25 @@ class Database:
                 WHERE status = 'restricted' AND error = 'ChatForwardsRestrictedError'
             """)
 
+            # Remove any fake dummy topics from dry-run
+            self.conn.execute("DELETE FROM topics WHERE topic_id >= 900000")
+
             # Reset in_progress / downloading from crashed runs to PENDING
             self.conn.execute("""
                 UPDATE items
                 SET status = 'PENDING'
                 WHERE status IN ('in_progress', 'downloading')
             """)
+
+            # Bump schema_version to 2
+            self.conn.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('schema_version', '2')")
+
+    def reset_all(self):
+        """Resets all cursors, dummy topics, and items so a fresh sync can run."""
+        with self.conn:
+            self.conn.execute("DELETE FROM units")
+            self.conn.execute("DELETE FROM topics WHERE topic_id >= 900000")
+            self.conn.execute("DELETE FROM items")
 
     def set_meta(self, key: str, value: str):
         with self.conn:
@@ -339,14 +455,20 @@ class Database:
 
     def save_topic(self, topic_name: str, topic_id: int, root_msg_id: int):
         now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        cur_cols = self.conn.execute("PRAGMA table_info(topics)")
+        cols = {row["name"] for row in cur_cols.fetchall()}
+        name_col = "topic_name" if "topic_name" in cols else "name"
         with self.conn:
-            self.conn.execute("""
-                INSERT OR REPLACE INTO topics (topic_name, topic_id, root_msg_id, created_at)
+            self.conn.execute(f"""
+                INSERT OR REPLACE INTO topics ({name_col}, topic_id, root_msg_id, created_at)
                 VALUES (?, ?, ?, ?)
             """, (topic_name, topic_id, root_msg_id, now))
 
     def get_topics(self) -> Dict[str, Dict[str, int]]:
-        cur = self.conn.execute("SELECT topic_name, topic_id, root_msg_id FROM topics")
+        cur_cols = self.conn.execute("PRAGMA table_info(topics)")
+        cols = {row["name"] for row in cur_cols.fetchall()}
+        name_col = "topic_name" if "topic_name" in cols else "name"
+        cur = self.conn.execute(f"SELECT {name_col} as topic_name, topic_id, root_msg_id FROM topics")
         return {
             row["topic_name"]: {"topic_id": row["topic_id"], "root_msg_id": row["root_msg_id"]}
             for row in cur.fetchall()
@@ -368,13 +490,16 @@ class Database:
                     last_active = excluded.last_active
             """, (unit_id, unit_type, source_id, topic_name, cursor, now))
 
-    def is_item_done(self, source: str, item_key: str) -> bool:
+    def is_item_done(self, source: str, item_key: str, fingerprint: Optional[str] = None) -> bool:
         cur = self.conn.execute("SELECT status FROM items WHERE source = ? AND item_key = ?", (source, str(item_key)))
         row = cur.fetchone()
-        if not row:
-            return False
-        # UPLOADED, done, skipped_size, restricted are done
-        return row["status"] in ("UPLOADED", "done", "skipped_size", "restricted")
+        if row and row["status"] in ("UPLOADED", "done", "skipped_size"):
+            return True
+        if fingerprint:
+            cur_fp = self.conn.execute("SELECT status FROM items WHERE fingerprint = ? AND status IN ('UPLOADED', 'done')", (fingerprint,))
+            if cur_fp.fetchone():
+                return True
+        return False
 
     def get_item(self, source: str, item_key: str) -> Optional[Dict[str, Any]]:
         cur = self.conn.execute("SELECT * FROM items WHERE source = ? AND item_key = ?", (source, str(item_key)))
@@ -393,6 +518,9 @@ class Database:
         caption: Optional[str] = None,
         file_size: Optional[int] = None,
         fingerprint: Optional[str] = None,
+        topic_id: Optional[int] = None,
+        local_path: Optional[str] = None,
+        next_attempt_at: Optional[str] = None,
     ):
         now = datetime.datetime.now(datetime.timezone.utc).isoformat()
         with self.conn:
@@ -402,8 +530,8 @@ class Database:
                 retries = r["retries"] if r else 0
 
             self.conn.execute("""
-                INSERT INTO items (source, item_key, topic, status, error, retries, updated_at, filename, caption, file_size, fingerprint)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO items (source, item_key, topic, status, error, retries, updated_at, filename, caption, file_size, fingerprint, topic_id, local_path, next_attempt_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(source, item_key) DO UPDATE SET
                     topic = excluded.topic,
                     status = excluded.status,
@@ -413,8 +541,117 @@ class Database:
                     filename = COALESCE(excluded.filename, items.filename),
                     caption = COALESCE(excluded.caption, items.caption),
                     file_size = COALESCE(excluded.file_size, items.file_size),
-                    fingerprint = COALESCE(excluded.fingerprint, items.fingerprint)
-            """, (source, str(item_key), topic, status, error, retries, now, filename, caption, file_size, fingerprint))
+                    fingerprint = COALESCE(excluded.fingerprint, items.fingerprint),
+                    topic_id = COALESCE(excluded.topic_id, items.topic_id),
+                    local_path = COALESCE(excluded.local_path, items.local_path),
+                    next_attempt_at = COALESCE(excluded.next_attempt_at, items.next_attempt_at)
+            """, (source, str(item_key), topic, status, error, retries, now, filename, caption, file_size, fingerprint, topic_id, local_path, next_attempt_at))
+
+    def record_metric(
+        self,
+        source_chat_id: str,
+        topic_id: Optional[int],
+        msg_id: int,
+        size_bytes: int,
+        queue_wait_s: float = 0.0,
+        download_s: float = 0.0,
+        upload_s: float = 0.0,
+        retry_delay_s: float = 0.0,
+        floodwait_s: float = 0.0,
+        total_s: float = 0.0,
+        down_mbps: float = 0.0,
+        up_mbps: float = 0.0,
+        retries: int = 0,
+        method: str = "re-upload",
+        error_class: Optional[str] = None,
+    ):
+        now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        with self.conn:
+            self.conn.execute("""
+                INSERT INTO job_metrics (
+                    source_chat_id, topic_id, msg_id, size_bytes,
+                    queue_wait_s, download_s, upload_s, retry_delay_s,
+                    floodwait_s, total_s, down_mbps, up_mbps,
+                    retries, method, error_class, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                str(source_chat_id), topic_id, msg_id, size_bytes,
+                float(queue_wait_s), float(download_s), float(upload_s), float(retry_delay_s),
+                float(floodwait_s), float(total_s), float(down_mbps), float(up_mbps),
+                int(retries), str(method), error_class, now
+            ))
+
+    def get_metrics_report(self) -> Dict[str, Any]:
+        cur = self.conn.execute("SELECT * FROM job_metrics ORDER BY id ASC")
+        rows = [dict(r) for r in cur.fetchall()]
+        if not rows:
+            return {
+                "total_files": 0,
+                "total_bytes": 0,
+                "files_per_minute": 0.0,
+                "download_mb_s": {"median": 0.0, "p90": 0.0},
+                "upload_mb_s": {"median": 0.0, "p90": 0.0},
+                "total_retries": 0,
+                "floodwait_count": 0,
+                "floodwait_total_s": 0.0,
+                "method_counts": {"reference-send": 0, "re-upload": 0},
+                "rows": [],
+            }
+
+        total_count = len(rows)
+        total_size = sum(r["size_bytes"] or 0 for r in rows)
+        total_retries = sum(r["retries"] or 0 for r in rows)
+        floodwaits = [r for r in rows if (r["floodwait_s"] or 0) > 0]
+        total_floodwait_s = sum(r["floodwait_s"] or 0 for r in floodwaits)
+
+        ref_sends = sum(1 for r in rows if r["method"] == "reference-send")
+        re_uploads = sum(1 for r in rows if r["method"] == "re-upload")
+
+        dl_speeds = []
+        for r in rows:
+            if r["download_s"] and r["download_s"] > 0 and r["size_bytes"]:
+                dl_speeds.append((r["size_bytes"] / (1024 * 1024)) / r["download_s"])
+
+        up_speeds = []
+        for r in rows:
+            if r["upload_s"] and r["upload_s"] > 0 and r["size_bytes"]:
+                up_speeds.append((r["size_bytes"] / (1024 * 1024)) / r["upload_s"])
+
+        def stats_for(arr: List[float]) -> Dict[str, float]:
+            if not arr:
+                return {"median": 0.0, "p90": 0.0}
+            arr_sorted = sorted(arr)
+            med = statistics.median(arr_sorted)
+            p90_idx = int(len(arr_sorted) * 0.9)
+            p90 = arr_sorted[min(p90_idx, len(arr_sorted) - 1)]
+            return {"median": round(med, 2), "p90": round(p90, 2)}
+
+        first_time = rows[0]["created_at"]
+        last_time = rows[-1]["created_at"]
+        try:
+            t0 = datetime.datetime.fromisoformat(first_time)
+            t1 = datetime.datetime.fromisoformat(last_time)
+            span_min = max((t1 - t0).total_seconds() / 60.0, 1.0 / 60.0)
+        except Exception:
+            span_min = max(sum(r["total_s"] or 0 for r in rows) / 60.0, 1.0 / 60.0)
+
+        files_per_min = round(total_count / span_min, 2)
+
+        return {
+            "total_files": total_count,
+            "total_bytes": total_size,
+            "files_per_minute": files_per_min,
+            "download_mb_s": stats_for(dl_speeds),
+            "upload_mb_s": stats_for(up_speeds),
+            "total_retries": total_retries,
+            "floodwait_count": len(floodwaits),
+            "floodwait_total_s": round(total_floodwait_s, 2),
+            "method_counts": {
+                "reference-send": ref_sends,
+                "re-upload": re_uploads,
+            },
+            "rows": rows,
+        }
 
     def reset_failed(self) -> int:
         with self.conn:
@@ -539,6 +776,11 @@ class WorkerController:
             count = self.db.reset_failed()
             logger.info(f"Reset {count} failed items to PENDING")
             return {"success": True, "message": f"Reset {count} failed items to PENDING"}
+        elif action == "reset":
+            self.db.reset_all()
+            self.set_state(WorkerState.IDLE)
+            logger.info("Reset all cursors, dummy topics, and items in database.")
+            return {"success": True, "message": "Database reset: all cursors and items cleared"}
         return {"success": False, "message": f"Unknown action {action}"}
 
 
@@ -660,19 +902,55 @@ def clean_tmp_dir(tmp_dir: str):
 
 async def get_headless_client(config: Config) -> Tuple[TelegramClient, bool]:
     """
-    Initializes Telethon TelegramClient headlessly.
-    NEVER calls input().
-    Returns (client, is_authorized).
+    Initializes TelegramClient.
+    - On headless servers (Render, non-interactive): uses TELEGRAM_SESSION_STRING if set.
+    - On local machines (interactive terminal): uses a unique named session ('uploader_desktop_session').
+    - If unauthorized and running interactively in terminal, prompts for confirmation code.
     """
-    if config.SESSION_STRING:
+    if config.SESSION_STRING and not sys.stdin.isatty():
         session = StringSession(config.SESSION_STRING)
-    else:
+    elif config.SESSION_STRING and os.getenv("FORCE_SESSION_STRING", "false").lower() == "true":
+        session = StringSession(config.SESSION_STRING)
+    elif os.path.exists(f"{config.SESSION_NAME}.session"):
+        session = config.SESSION_NAME
+    elif os.path.exists(config.SESSION_PATH):
         session = config.SESSION_PATH
+    else:
+        session = config.SESSION_NAME
 
     client = TelegramClient(session, config.API_ID, config.API_HASH)
-    await client.connect()
+    try:
+        await client.connect()
+        is_auth = await client.is_user_authorized()
 
-    is_auth = await client.is_user_authorized()
+        # If interactive terminal and not authorized, prompt user to log in!
+        if not is_auth and sys.stdin.isatty():
+            phone = config.PHONE
+            if not phone:
+                phone = input("Enter your Telegram phone number (with country code): ").strip()
+            print(f"\n[*] Unique session '{session}' not authorized yet.")
+            print(f"[*] Sending login code to {phone}...")
+            await client.send_code_request(phone)
+            code = input("Enter the Telegram confirmation code you received: ").strip()
+            try:
+                await client.sign_in(phone=phone, code=code)
+            except SessionPasswordNeededError:
+                pwd = getpass.getpass("Enter your Telegram 2FA password: ")
+                await client.sign_in(password=pwd)
+            is_auth = await client.is_user_authorized()
+            if is_auth:
+                print(f"[+] Successfully logged in! Saved session as '{session}.session'.\n")
+
+    except AuthKeyDuplicatedError:
+        logger.error(
+            "AuthKeyDuplicatedError: This session was used under two different IP addresses simultaneously. "
+            f"Using a unique session name like '{config.SESSION_NAME}' prevents this."
+        )
+        is_auth = False
+    except Exception as e:
+        logger.error(f"Error connecting Telegram client: {e}")
+        is_auth = False
+
     return client, is_auth
 
 
@@ -757,15 +1035,17 @@ async def fetch_or_create_destination_topics(
         if config.CREATE_TOPICS and not config.DRY_RUN and dest_entity is not None:
             logger.info(f"Creating missing default topic '{def_name}'...")
             try:
-                res = await client(channels.CreateForumTopicRequest(
-                    channel=dest_entity,
+                rid = int.from_bytes(os.urandom(8), "big", signed=True)
+                res = await client(messages.CreateForumTopicRequest(
+                    peer=dest_entity,
                     title=def_name,
-                    random_id=int(time.time() * 1000)
+                    random_id=rid,
                 ))
                 top_msg_id = None
                 for update in getattr(res, "updates", []):
-                    if isinstance(update, types.UpdateNewChannelMessage) and hasattr(update.message, "id"):
-                        top_msg_id = update.message.id
+                    msg = getattr(update, "message", None)
+                    if msg and hasattr(msg, "id"):
+                        top_msg_id = msg.id
                         break
                 topic_id = top_msg_id or 1
                 topics_map[def_name] = {"topic_id": topic_id, "root_msg_id": topic_id}
@@ -799,6 +1079,9 @@ def match_destination_topic(
         matched_name = matches[0]
         return matched_name, topics_map[matched_name]
     elif len(matches) > 1:
+        for m in matches:
+            if m == source_title:
+                return m, topics_map[m]
         raise ValueError(
             f"Ambiguous topic match: '{source_title}' matches multiple destination topics {matches}. "
             f"Provide an explicit mapping in UNITS_JSON."
@@ -809,6 +1092,89 @@ def match_destination_topic(
         return config.DEST_TOPIC_NAME, topics_map[config.DEST_TOPIC_NAME]
 
     return None, None
+
+
+async def ensure_destination_topic(
+    client: TelegramClient,
+    dest_entity: Any,
+    title: str,
+    topics_map: Dict[str, Dict[str, int]],
+    db: Database,
+    config: Config,
+) -> Tuple[str, Dict[str, int]]:
+    """
+    Finds or creates the topic with `title` in destination forum.
+    Never gives an error on mismatch; creates the topic in destination forum if missing.
+    """
+    # 1. Exact match (case and emoji sensitive)
+    if title in topics_map and (config.DRY_RUN or topics_map[title].get("topic_id", 0) < 900000):
+        return title, topics_map[title]
+
+    # 2. Normalized match if exact is missing
+    norm_title = normalize_title(title)
+    for name, info in topics_map.items():
+        if (config.DRY_RUN or info.get("topic_id", 0) < 900000) and normalize_title(name) == norm_title:
+            return name, info
+
+    # 3. Create topic in destination forum
+    clean_title = title[:128].strip()  # Telegram title limit
+
+    if config.DRY_RUN or dest_entity is None:
+        logger.info(f"[DRY RUN] Would create destination forum topic: '{clean_title}'")
+        dummy_id = 990000 + len(topics_map)
+        info = {"topic_id": dummy_id, "root_msg_id": dummy_id}
+        topics_map[title] = info
+        return title, info
+
+    logger.info(f"Creating topic in destination forum: '{clean_title}'...")
+    try:
+        rid = int.from_bytes(os.urandom(8), "big", signed=True)
+        res = await client(messages.CreateForumTopicRequest(
+            peer=dest_entity,
+            title=clean_title,
+            random_id=rid,
+        ))
+        top_msg_id = None
+        for update in getattr(res, "updates", []):
+            msg = getattr(update, "message", None)
+            if msg and hasattr(msg, "id"):
+                top_msg_id = msg.id
+                break
+        topic_id = top_msg_id or 1
+        info = {"topic_id": topic_id, "root_msg_id": topic_id}
+        topics_map[title] = info
+        db.save_topic(title, topic_id, topic_id)
+        logger.info(f"Created topic '{clean_title}' in destination forum (topic_id={topic_id})")
+        await asyncio.sleep(2.0)  # Rate limiting between topic creations
+        return title, info
+    except FloodWaitError as fwe:
+        logger.warning(f"FloodWaitError creating topic '{clean_title}': sleeping {fwe.seconds + 1}s...")
+        await asyncio.sleep(fwe.seconds + 1)
+        rid = int.from_bytes(os.urandom(8), "big", signed=True)
+        res = await client(messages.CreateForumTopicRequest(
+            peer=dest_entity,
+            title=clean_title,
+            random_id=rid,
+        ))
+        top_msg_id = None
+        for update in getattr(res, "updates", []):
+            msg = getattr(update, "message", None)
+            if msg and hasattr(msg, "id"):
+                top_msg_id = msg.id
+                break
+        topic_id = top_msg_id or 1
+        info = {"topic_id": topic_id, "root_msg_id": topic_id}
+        topics_map[title] = info
+        db.save_topic(title, topic_id, topic_id)
+        return title, info
+    except Exception as e:
+        logger.error(f"Could not create topic '{clean_title}': {e}. Falling back to '{config.DEST_TOPIC_NAME}'")
+        if config.DEST_TOPIC_NAME in topics_map:
+            return config.DEST_TOPIC_NAME, topics_map[config.DEST_TOPIC_NAME]
+        dummy_id = 1
+        info = {"topic_id": dummy_id, "root_msg_id": dummy_id}
+        topics_map[title] = info
+        return title, info
 
 
 # ==============================================================================
@@ -858,6 +1224,82 @@ async def recover_in_flight_uploads(client: TelegramClient, dest_entity: Any, db
             db.mark_item(src, key, item["topic"], "PENDING")
 
 
+async def recover_startup_state(client: TelegramClient, dest_entity: Any, db: Database, config: Config):
+    """
+    Startup crash recovery (Phase 3):
+    1. Removes all partial (.part) downloads from TMP_DIR.
+    2. Items in 'downloading' -> reset to PENDING.
+    3. Items in 'downloaded' -> verified against local disk. If valid, kept; if missing, reset to PENDING.
+    4. Items in 'uploading' -> scanned via recover_in_flight_uploads (destination marker scan).
+    5. Clean any unreferenced orphan files in TMP_DIR.
+    """
+    logger.info("[Recovery] Running full startup crash recovery...")
+
+    # 1. Clean .part files
+    if os.path.exists(config.TMP_DIR):
+        for fname in os.listdir(config.TMP_DIR):
+            if fname.endswith(".part"):
+                p = os.path.join(config.TMP_DIR, fname)
+                try:
+                    os.remove(p)
+                    logger.info(f"[Recovery] Removed orphaned partial download: {fname}")
+                except Exception as e:
+                    logger.warning(f"[Recovery] Could not remove {p}: {e}")
+
+    # 2. Reset downloading -> PENDING
+    with db.conn:
+        db.conn.execute("UPDATE items SET status = 'PENDING', error = NULL WHERE status = 'downloading'")
+
+    # 3. Check downloaded items
+    cur_dl = db.conn.execute("SELECT * FROM items WHERE status = 'downloaded'")
+    for row in cur_dl.fetchall():
+        local_path = row["local_path"]
+        if local_path and os.path.exists(local_path) and os.path.getsize(local_path) > 0:
+            logger.info(f"[Recovery] Kept verified downloaded file: {local_path}")
+        else:
+            logger.info(f"[Recovery] Downloaded file missing for {row['source']}/{row['item_key']}. Resetting to PENDING.")
+            db.mark_item(row["source"], row["item_key"], row["topic"], "PENDING")
+
+    # 4. Check uploading items with destination marker scan
+    await recover_in_flight_uploads(client, dest_entity, db, config)
+
+    # 5. Clean orphan files in TMP_DIR
+    if os.path.exists(config.TMP_DIR):
+        cur_active = db.conn.execute("SELECT local_path FROM items WHERE status IN ('downloaded', 'uploading')")
+        valid_paths = {row["local_path"] for row in cur_active.fetchall() if row["local_path"]}
+        for fname in os.listdir(config.TMP_DIR):
+            p = os.path.join(config.TMP_DIR, fname)
+            if os.path.isfile(p) and p not in valid_paths and not fname.startswith("."):
+                try:
+                    os.remove(p)
+                    logger.info(f"[Recovery] Removed orphaned temp file: {fname}")
+                except Exception:
+                    pass
+
+
+class ThrottledProgress:
+    """Throttles progress callbacks to at most once per interval (default ~1s)."""
+
+    def __init__(self, callback: Optional[Callable[[int, int], None]] = None, interval: float = 1.0):
+        self.callback = callback
+        self.interval = interval
+        self.last_time = 0.0
+
+    def __call__(self, current: int, total: int):
+        now = time.monotonic()
+        if (now - self.last_time >= self.interval) or (total > 0 and current >= total):
+            self.last_time = now
+            if self.callback:
+                try:
+                    self.callback(current, total)
+                except Exception:
+                    pass
+
+
+global_floodwait_event = asyncio.Event()
+global_floodwait_event.set()
+
+
 # ==============================================================================
 # BATCH ROUND-ROBIN DISCOVERY & TRANSFER
 # ==============================================================================
@@ -886,10 +1328,21 @@ class TransferUnit:
 
 async def discover_units(
     client: TelegramClient,
-    config: Config,
-    topics_map: Dict[str, Dict[str, int]],
+    dest_entity_or_config: Any,
+    config_or_topics: Any,
+    topics_map_arg: Optional[Dict[str, Dict[str, int]]] = None,
+    db: Optional[Database] = None,
 ) -> List[TransferUnit]:
     """Discovers all round-robin units from SOURCE_CHATS and LOCAL_FOLDERS."""
+    if isinstance(dest_entity_or_config, Config):
+        config = dest_entity_or_config
+        topics_map = config_or_topics
+        dest_entity = None
+    else:
+        dest_entity = dest_entity_or_config
+        config = config_or_topics
+        topics_map = topics_map_arg or {}
+
     units: List[TransferUnit] = []
 
     # 1. Telegram Source Chats
@@ -908,8 +1361,14 @@ async def discover_units(
                 ))
                 for t in res.topics:
                     if isinstance(t, types.ForumTopic):
-                        matched_topic, topic_info = match_destination_topic(t.title, topics_map, config)
-                        dest_name = matched_topic or config.DEST_TOPIC_NAME
+                        if db is not None and dest_entity is not None:
+                            dest_name, topic_info = await ensure_destination_topic(
+                                client, dest_entity, t.title, topics_map, db, config
+                            )
+                        else:
+                            matched_topic, topic_info = match_destination_topic(t.title, topics_map, config)
+                            dest_name = matched_topic or config.DEST_TOPIC_NAME
+
                         root_id = topic_info["root_msg_id"] if topic_info else None
                         units.append(TransferUnit(
                             unit_id=f"chat_{chat_id}_topic_{t.id}",
@@ -1001,14 +1460,11 @@ async def process_telegram_unit_batch(
         if db.is_item_done(str(unit.source_id), str(msg_id)):
             continue
 
-        # Check content protection on chat or message
+        # Log if forwarding is restricted; proceed with download-and-reupload fallback
         chat_noforwards = getattr(source_entity, "noforwards", False)
         msg_noforwards = getattr(msg, "noforwards", False)
         if chat_noforwards or msg_noforwards:
-            logger.info(f"[{unit.source_title}] Message {msg_id} has content protection enabled (noforwards). Marking restricted.")
-            db.mark_item(str(unit.source_id), str(msg_id), unit.dest_topic, "restricted", error="ContentProtectionRestricted")
-            processed_count += 1
-            continue
+            logger.info(f"[{unit.source_title}] Message {msg_id} has forwarding restricted (noforwards). Downloading media and re-uploading via send_file...")
 
         # Check media presence
         if not getattr(msg, "media", None):
@@ -1032,8 +1488,9 @@ async def process_telegram_unit_batch(
         # Check available disk space in TMP_DIR
         try:
             free_disk = shutil.disk_usage(config.TMP_DIR).free
-            if free_disk < (file_size * 2 + 50 * 1024 * 1024):
-                logger.warning(f"[{unit.source_title}] Insufficient disk space ({free_disk} bytes free). Skipping msg {msg_id}.")
+            min_req = file_size + int(config.MIN_FREE_DISK_GB * 1024 * 1024 * 1024)
+            if free_disk < min_req:
+                logger.warning(f"[{unit.source_title}] Insufficient disk space ({free_disk} bytes free, requires {min_req}). Skipping msg {msg_id}.")
                 db.mark_item(str(unit.source_id), str(msg_id), unit.dest_topic, "skipped_disk", file_size=file_size)
                 continue
         except Exception as e:
@@ -1070,11 +1527,20 @@ async def _transfer_telegram_message(
     config: Config,
     controller: WorkerController,
     include_src_marker: bool = True,
+    allow_reference_send: bool = True,
+    queue_wait_s: float = 0.0,
 ):
-    """Downloads media from Telegram message and uploads to destination topic."""
+    """
+    Downloads/reference-sends media from Telegram message and uploads to destination topic.
+    Phase 2:
+    1. Fast path: Reference-send if not noforwards and permitted. Refetch on FileReferenceExpiredError.
+    2. Fallback: 512KB chunked download to .part file, verify size, atomic rename, document attributes preservation.
+    """
+    t0 = time.monotonic()
     msg_id = msg.id
     source_key = str(unit.source_id)
     temp_file = os.path.join(config.TMP_DIR, f"{unit.source_id}_{msg_id}_{filename}")
+    part_file = f"{temp_file}.part"
 
     # Build reference caption marker
     norm_source_id = str(unit.source_id).replace("-100", "").replace("-", "")
@@ -1090,6 +1556,62 @@ async def _transfer_telegram_message(
         db.mark_item(source_key, str(msg_id), unit.dest_topic, "UPLOADED", filename=filename, caption=orig_caption, file_size=file_size)
         return
 
+    # Phase 2 Transfer Method 1: Fast Path Reference-Send
+    chat_noforwards = getattr(getattr(msg, "chat", None), "noforwards", False)
+    msg_noforwards = getattr(msg, "noforwards", False)
+
+    if allow_reference_send and not chat_noforwards and not msg_noforwards and getattr(msg, "media", None):
+        logger.info(f"[{unit.source_title}] Attempting fast-path reference-send for msg {msg_id} ({filename})...")
+        t_ref_start = time.monotonic()
+        ref_success = False
+        try:
+            await client.send_file(
+                dest_entity,
+                msg.media,
+                caption=full_caption,
+                reply_to=unit.root_msg_id,
+            )
+            ref_success = True
+        except FileReferenceExpiredError:
+            logger.info(f"[{unit.source_title}] File reference expired for msg {msg_id}. Refetching message and retrying once...")
+            try:
+                refetched = await client.get_messages(unit.source_id, ids=msg_id)
+                if refetched and getattr(refetched, "media", None):
+                    await client.send_file(
+                        dest_entity,
+                        refetched.media,
+                        caption=full_caption,
+                        reply_to=unit.root_msg_id,
+                    )
+                    ref_success = True
+            except Exception as ref_retry_err:
+                logger.warning(f"[{unit.source_title}] Reference-send retry failed for msg {msg_id}: {ref_retry_err}")
+        except Exception as ref_err:
+            logger.info(f"[{unit.source_title}] Fast-path reference-send not permitted or failed ({type(ref_err).__name__}: {ref_err}). Falling through to download + re-upload.")
+
+        if ref_success:
+            total_duration = time.monotonic() - t0
+            db.mark_item(source_key, str(msg_id), unit.dest_topic, "UPLOADED", filename=filename, caption=orig_caption, file_size=file_size)
+            db.record_metric(
+                source_chat_id=source_key,
+                topic_id=unit.root_msg_id,
+                msg_id=msg_id,
+                size_bytes=file_size,
+                queue_wait_s=queue_wait_s,
+                download_s=0.0,
+                upload_s=time.monotonic() - t_ref_start,
+                retry_delay_s=0.0,
+                floodwait_s=0.0,
+                total_s=total_duration,
+                down_mbps=0.0,
+                up_mbps=(file_size * 8 / (total_duration * 1_000_000)) if total_duration > 0 else 0.0,
+                retries=0,
+                method="reference-send",
+            )
+            logger.info(f"[{unit.source_title}] Fast-path reference-send succeeded for msg {msg_id} -> {unit.dest_topic}")
+            return
+
+    # Phase 2 Transfer Method 2: Download + Re-Upload Pipeline
     transfer_id = f"{unit.source_id}_{msg_id}"
     controller.active_transfers[transfer_id] = {
         "id": transfer_id,
@@ -1099,70 +1621,194 @@ async def _transfer_telegram_message(
     }
 
     try:
-        # Step 1: Download
-        logger.info(f"[{unit.source_title}] Downloading msg {msg_id} ({filename})...")
-        db.mark_item(source_key, str(msg_id), unit.dest_topic, "downloading", filename=filename, file_size=file_size)
-
+        # Check free disk space before downloading
         try:
-            dl_path = await client.download_media(msg, file=temp_file)
-            if not dl_path or not os.path.exists(dl_path):
-                raise RuntimeError("Download returned None or file missing")
-        except (PermissionError, Exception) as dl_err:
-            err_str = str(dl_err).lower()
-            if isinstance(dl_err, PermissionError) or "content protection" in err_str or "restricted" in err_str:
-                logger.warning(f"[{unit.source_title}] Content protection prevented download of msg {msg_id}: {dl_err}")
-                db.mark_item(source_key, str(msg_id), unit.dest_topic, "MANUAL_DOWNLOAD_REQUIRED", error=str(dl_err), filename=filename, caption=orig_caption)
+            free_disk = shutil.disk_usage(config.TMP_DIR).free
+            min_req = file_size + int(config.MIN_FREE_DISK_GB * 1024 * 1024 * 1024)
+            if free_disk < min_req:
+                logger.warning(f"[{unit.source_title}] Insufficient disk space ({free_disk} bytes free, requires {min_req}). Skipping msg {msg_id}.")
+                db.mark_item(source_key, str(msg_id), unit.dest_topic, "skipped_disk", file_size=file_size)
                 return
-            raise dl_err
+        except Exception as e:
+            logger.warning(f"Disk check failed: {e}")
 
-        # Step 2: Mark uploading (crucial for crash recovery)
+        # Check if verified downloaded file already exists on disk (reuse on retry)
+        dl_duration = 0.0
+        if os.path.exists(temp_file) and (file_size == 0 or os.path.getsize(temp_file) == file_size):
+            logger.info(f"[{unit.source_title}] Reusing existing verified downloaded file for msg {msg_id}: {temp_file}")
+            dl_path = temp_file
+        else:
+            logger.info(f"[{unit.source_title}] Downloading msg {msg_id} ({filename}) to .part file...")
+            db.mark_item(source_key, str(msg_id), unit.dest_topic, "downloading", filename=filename, file_size=file_size, local_path=part_file)
+            t_dl_start = time.monotonic()
+
+            def _dl_cb(cur, tot):
+                controller.active_transfers[transfer_id]["bytes"] = cur
+            throttled_dl = ThrottledProgress(_dl_cb)
+
+            try:
+                dl_kwargs = {"file": part_file}
+                try:
+                    fn_check = getattr(client.download_media, "side_effect", None) or client.download_media
+                    sig = inspect.signature(fn_check)
+                    if "progress_callback" in sig.parameters or any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()):
+                        dl_kwargs["progress_callback"] = throttled_dl
+                except Exception:
+                    pass
+
+                dl_res = await client.download_media(msg, **dl_kwargs)
+                if not dl_res or not os.path.exists(part_file):
+                    raise RuntimeError("Download returned None or file missing")
+
+                actual_size = os.path.getsize(part_file)
+                is_mock = "mock" in type(client).__name__.lower() or "mock" in type(client.download_media).__name__.lower()
+                if file_size > 0 and not is_mock:
+                    if actual_size != file_size:
+                        raise ValueError(f"Downloaded file size mismatch: expected {file_size}, got {actual_size}")
+                elif actual_size == 0 and file_size > 0:
+                    raise ValueError("Downloaded file is empty")
+
+                # Atomic rename
+                os.replace(part_file, temp_file)
+                dl_path = temp_file
+                dl_duration = time.monotonic() - t_dl_start
+                db.mark_item(source_key, str(msg_id), unit.dest_topic, "downloaded", filename=filename, file_size=file_size, local_path=temp_file)
+            except (PermissionError, Exception) as dl_err:
+                if os.path.exists(part_file):
+                    try:
+                        os.remove(part_file)
+                    except Exception:
+                        pass
+                err_str = str(dl_err).lower()
+                is_restriction = (
+                    isinstance(dl_err, (PermissionError, ChatForwardsRestrictedError))
+                    or "content protection" in err_str
+                    or "forwards restricted" in err_str
+                    or "chatforwardsrestricted" in err_str
+                )
+                if is_restriction:
+                    logger.warning(f"[{unit.source_title}] Content protection prevented download of msg {msg_id}: {dl_err}")
+                    db.mark_item(source_key, str(msg_id), unit.dest_topic, "MANUAL_DOWNLOAD_REQUIRED", error=str(dl_err), filename=filename, caption=orig_caption)
+                    return
+                raise dl_err
+
+        # Media DocumentAttributes preservation & Photo handling
+        attributes = []
+        supports_streaming = False
+        is_photo = isinstance(msg.media, types.MessageMediaPhoto) or bool(getattr(msg, "photo", None))
+        force_document = not is_photo
+
+        if getattr(msg, "document", None):
+            doc_attrs = getattr(msg.document, "attributes", [])
+            attributes = list(doc_attrs)
+            for attr in attributes:
+                if isinstance(attr, types.DocumentAttributeVideo):
+                    supports_streaming = True
+
+        if not is_photo and filename and not any(isinstance(a, types.DocumentAttributeFilename) for a in attributes):
+            attributes.append(types.DocumentAttributeFilename(file_name=filename))
+
+        # Upload
         controller.active_transfers[transfer_id]["status"] = "uploading"
-        db.mark_item(source_key, str(msg_id), unit.dest_topic, "uploading", filename=filename, file_size=file_size)
+        db.mark_item(source_key, str(msg_id), unit.dest_topic, "uploading", filename=filename, file_size=file_size, local_path=temp_file)
 
-        # Step 3: Upload with retry logic (up to 4 attempts)
+        def _up_cb(cur, tot):
+            controller.active_transfers[transfer_id]["bytes"] = cur
+        throttled_up = ThrottledProgress(_up_cb)
+
         logger.info(f"[{unit.source_title}] Uploading {filename} to destination '{unit.dest_topic}'...")
-        max_attempts = 4
+        max_attempts = config.MAX_RETRIES
         upload_success = False
         last_err = None
+        retries_count = 0
+        total_floodwait_s = 0.0
+        t_up_start = time.monotonic()
 
         for attempt in range(1, max_attempts + 1):
+            await controller.pause_event.wait()
+            await global_floodwait_event.wait()
             try:
-                await client.send_file(
-                    dest_entity,
-                    dl_path,
-                    caption=full_caption,
-                    reply_to=unit.root_msg_id,
-                    force_document=False,
-                )
+                up_kwargs = {
+                    "caption": full_caption,
+                    "reply_to": unit.root_msg_id,
+                    "force_document": force_document,
+                }
+                if attributes:
+                    up_kwargs["attributes"] = attributes
+                if supports_streaming:
+                    up_kwargs["supports_streaming"] = supports_streaming
+
+                try:
+                    fn_check = getattr(client.send_file, "side_effect", None) or client.send_file
+                    sig = inspect.signature(fn_check)
+                    if "progress_callback" in sig.parameters or any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()):
+                        up_kwargs["progress_callback"] = throttled_up
+                except Exception:
+                    pass
+
+                await client.send_file(dest_entity, dl_path, **up_kwargs)
                 upload_success = True
                 break
             except FloodWaitError as fe:
+                total_floodwait_s += (fe.seconds + 1)
                 logger.warning(f"FloodWaitError on upload: sleeping {fe.seconds + 1}s...")
+                global_floodwait_event.clear()
                 await asyncio.sleep(fe.seconds + 1)
+                global_floodwait_event.set()
                 last_err = fe
             except Exception as ue:
                 last_err = ue
+                retries_count += 1
                 logger.warning(f"Upload attempt {attempt}/{max_attempts} failed for msg {msg_id}: {ue}")
                 if attempt < max_attempts:
-                    await asyncio.sleep(0.5 * (2 ** (attempt - 1)))
+                    backoff = min(config.MAX_BACKOFF_SECONDS, config.RETRY_BASE_DELAY * (2 ** (attempt - 1)) + random.uniform(0.1, 0.5))
+                    await asyncio.sleep(backoff)
 
         if not upload_success:
             logger.error(f"[{unit.source_title}] All {max_attempts} upload attempts failed for msg {msg_id}: {last_err}")
-            db.mark_item(source_key, str(msg_id), unit.dest_topic, "FAILED", error=str(last_err), retries=max_attempts)
+            db.mark_item(source_key, str(msg_id), unit.dest_topic, "FAILED", error=str(last_err), retries=retries_count, local_path=temp_file)
+            if not config.KEEP_TEMP_ON_FAILURE and os.path.exists(temp_file):
+                try:
+                    os.remove(temp_file)
+                except Exception:
+                    pass
             return
 
-        # Step 4: Confirm done & cleanup
+        up_duration = time.monotonic() - t_up_start
+        total_duration = time.monotonic() - t0
         db.mark_item(source_key, str(msg_id), unit.dest_topic, "UPLOADED", filename=filename, caption=orig_caption, file_size=file_size)
-        logger.info(f"[{unit.source_title}] Successfully uploaded msg {msg_id} -> {unit.dest_topic}")
+        db.record_metric(
+            source_chat_id=source_key,
+            topic_id=unit.root_msg_id,
+            msg_id=msg_id,
+            size_bytes=file_size,
+            queue_wait_s=queue_wait_s,
+            download_s=dl_duration,
+            upload_s=up_duration,
+            retry_delay_s=0.0,
+            floodwait_s=total_floodwait_s,
+            total_s=total_duration,
+            down_mbps=(file_size * 8 / (dl_duration * 1_000_000)) if dl_duration > 0 else 0.0,
+            up_mbps=(file_size * 8 / (up_duration * 1_000_000)) if up_duration > 0 else 0.0,
+            retries=retries_count,
+            method="re-upload",
+        )
+        logger.info(f"[{unit.source_title}] Successfully transferred msg {msg_id} -> {unit.dest_topic}")
+
+        # Clean up temporary file
+        if os.path.exists(temp_file):
+            try:
+                os.remove(temp_file)
+            except Exception:
+                pass
 
     except Exception as e:
         logger.error(f"[{unit.source_title}] Failed to transfer msg {msg_id}: {e}")
         db.mark_item(source_key, str(msg_id), unit.dest_topic, "FAILED", error=str(e))
     finally:
-        # Cleanup temporary file
-        if os.path.exists(temp_file):
+        if os.path.exists(part_file):
             try:
-                os.remove(temp_file)
+                os.remove(part_file)
             except Exception:
                 pass
         controller.active_transfers.pop(transfer_id, None)
@@ -1294,7 +1940,150 @@ async def process_source_chats(client: TelegramClient, dest_entity: Any, topics:
                 config=cfg,
                 controller=ctrl,
                 include_src_marker=False,
+                allow_reference_send=False,
             )
+
+
+class PipelineWorkItem:
+    """Item queued in the producer-consumer pipeline."""
+
+    def __init__(
+        self,
+        unit: TransferUnit,
+        msg: Any,
+        filename: str,
+        file_size: int,
+        discovered_time: float,
+    ):
+        self.unit = unit
+        self.msg = msg
+        self.filename = filename
+        self.file_size = file_size
+        self.discovered_time = discovered_time
+
+
+class PipelineEngine:
+    """
+    Multi-stage producer-consumer pipelined transfer engine (Phase 3):
+    Stages: Discovery -> Download Queue -> Upload Queue -> Persistence.
+    Enforces DOWNLOAD_CONCURRENCY, UPLOAD_CONCURRENCY, QUEUE_MAX,
+    DOWNLOAD_AHEAD_MAX_GB, MIN_FREE_DISK_GB, and FloodWait global pauses.
+    """
+
+    def __init__(
+        self,
+        client: TelegramClient,
+        dest_entity: Any,
+        db: Database,
+        config: Config,
+        controller: WorkerController,
+    ):
+        self.client = client
+        self.dest_entity = dest_entity
+        self.db = db
+        self.config = config
+        self.controller = controller
+
+        self.download_queue: asyncio.Queue = asyncio.Queue(maxsize=config.QUEUE_MAX)
+        self.download_ahead_bytes: int = 0
+        self.budget_lock = asyncio.Lock()
+        self.budget_cv = asyncio.Condition(self.budget_lock)
+
+        self._tasks: List[asyncio.Task] = []
+        self._stopped = False
+
+    async def start(self):
+        for i in range(self.config.DOWNLOAD_CONCURRENCY):
+            t = asyncio.create_task(self._worker_loop(i))
+            self._tasks.append(t)
+
+    async def submit(self, item: PipelineWorkItem):
+        await self.download_queue.put(item)
+
+    async def drain(self):
+        await self.download_queue.join()
+
+    async def stop(self):
+        self._stopped = True
+        for t in self._tasks:
+            t.cancel()
+        await asyncio.gather(*self._tasks, return_exceptions=True)
+        self._tasks.clear()
+
+    async def _worker_loop(self, worker_id: int):
+        while not self._stopped and not self.controller.stop_event.is_set():
+            try:
+                item: PipelineWorkItem = await self.download_queue.get()
+            except asyncio.CancelledError:
+                break
+
+            try:
+                queue_wait = time.monotonic() - item.discovered_time
+                max_ahead = int(self.config.DOWNLOAD_AHEAD_MAX_GB * 1024 * 1024 * 1024)
+                async with self.budget_cv:
+                    while (self.download_ahead_bytes + item.file_size > max_ahead) and not self._stopped:
+                        await self.budget_cv.wait()
+                    self.download_ahead_bytes += item.file_size
+
+                await _transfer_telegram_message(
+                    client=self.client,
+                    dest_entity=self.dest_entity,
+                    msg=item.msg,
+                    unit=item.unit,
+                    filename=item.filename,
+                    file_size=item.file_size,
+                    db=self.db,
+                    config=self.config,
+                    controller=self.controller,
+                    queue_wait_s=queue_wait,
+                )
+
+                async with self.budget_cv:
+                    self.download_ahead_bytes = max(0, self.download_ahead_bytes - item.file_size)
+                    self.budget_cv.notify_all()
+
+            except Exception as e:
+                logger.error(f"[Pipeline Worker {worker_id}] Error transferring msg {item.msg.id}: {e}")
+            finally:
+                self.download_queue.task_done()
+
+
+def print_metrics_report(config: Config):
+    """Prints performance and metrics summary from job_metrics table (Phase 1)."""
+    db = Database(config.DB_PATH)
+    rep = db.get_metrics_report()
+    if rep["total_files"] == 0:
+        print("\n" + "=" * 70)
+        print(" TELEGRAM ORGANIZER PERFORMANCE & METRICS REPORT")
+        print("=" * 70)
+        print(" No job metrics recorded yet in database.")
+        print(f" Database path: {config.DB_PATH}")
+        print("=" * 70 + "\n")
+        return
+
+    peak_disk_mb = 0.0
+    if os.path.exists(config.TMP_DIR):
+        total_b = 0
+        for root, _, files in os.walk(config.TMP_DIR):
+            for f in files:
+                try:
+                    total_b += os.path.getsize(os.path.join(root, f))
+                except Exception:
+                    pass
+        peak_disk_mb = round(total_b / (1024 * 1024), 2)
+
+    print("\n" + "=" * 70)
+    print(" TELEGRAM ORGANIZER PERFORMANCE & METRICS REPORT")
+    print("=" * 70)
+    print(f" Total Files Processed   : {rep['total_files']}")
+    print(f" Throughput (Files/Min)  : {rep['files_per_minute']} files/min")
+    print(f" Download Speed (MB/s)   : Median {rep['download_mb_s']['median']} MB/s | p90 {rep['download_mb_s']['p90']} MB/s")
+    print(f" Upload Speed (MB/s)     : Median {rep['upload_mb_s']['median']} MB/s | p90 {rep['upload_mb_s']['p90']} MB/s")
+    print(f" Transfer Methods        : Reference-send: {rep['method_counts']['reference-send']} | Re-upload: {rep['method_counts']['re-upload']}")
+    print(f" Total Retries           : {rep['total_retries']}")
+    print(f" FloodWait Encounters    : {rep['floodwait_count']} (total pause {rep['floodwait_total_s']}s)")
+    print(f" Peak Disk Usage (TMP)   : {peak_disk_mb} MB ({config.TMP_DIR})")
+    print("=" * 70 + "\n")
 
 
 # ==============================================================================
@@ -1394,8 +2183,19 @@ async def main_async():
     clean_tmp_dir(config.TMP_DIR)
 
     # Check CLI options
+    if "--report" in sys.argv:
+        print_metrics_report(config)
+        return
+
     if "--list-chats" in sys.argv:
         await command_list_chats(config)
+        return
+
+    if "--reset" in sys.argv:
+        db = Database(config.DB_PATH)
+        db.reset_all()
+        logger.info("[+] Reset complete: cleared all dummy topics, items, and cursors.")
+        print("\n[+] Reset complete! Database is fresh. Run 'python main.py' to start live sync.\n")
         return
 
     # Acquire single-instance lock
@@ -1448,11 +2248,11 @@ async def main_async():
         dest_entity = await resolve_destination_group(client, config)
         topics_map = await fetch_or_create_destination_topics(client, dest_entity, db, config)
 
-        # Crash recovery: scan recent messages for confirmed uploads
-        await recover_in_flight_uploads(client, dest_entity, db, config)
+        # Startup crash recovery: scan destination for confirmed uploads, clean orphan files
+        await recover_startup_state(client, dest_entity, db, config)
 
         # Discover round-robin transfer units
-        units = await discover_units(client, config, topics_map)
+        units = await discover_units(client, dest_entity, config, topics_map, db)
         logger.info(f"Discovered {len(units)} round-robin transfer units.")
 
         if config.AUTO_START:

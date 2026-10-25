@@ -219,8 +219,8 @@ class TestBatchRoundRobinAndRecovery(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(self.db.is_item_done(str(self.source_id), "10"))
         self.assertTrue(self.db.is_item_done(str(self.source_id), "11"))
 
-    async def test_content_protection_noforwards_skips(self):
-        """When chat or message has noforwards=True, mark restricted and skip."""
+    async def test_content_protection_download_denial_handling(self):
+        """When forwarding is restricted and download is denied by content protection, mark MANUAL_DOWNLOAD_REQUIRED."""
         unit = TransferUnit(
             unit_id=f"chat_{self.source_id}",
             unit_type="telegram_chat",
@@ -241,6 +241,7 @@ class TestBatchRoundRobinAndRecovery(unittest.IsolatedAsyncioTestCase):
             yield msg
 
         self.client.iter_messages = mock_iter
+        self.client.download_media.side_effect = PermissionError("Cannot download: content protection restricted")
         semaphore = asyncio.Semaphore(2)
 
         processed = await process_telegram_unit_batch(
@@ -248,11 +249,11 @@ class TestBatchRoundRobinAndRecovery(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(processed, 1)
-        self.client.download_media.assert_not_called()
+        self.client.download_media.assert_called_once()
         self.client.send_file.assert_not_called()
 
         item = self.db.get_item(str(self.source_id), "50")
-        self.assertEqual(item["status"], "restricted")
+        self.assertEqual(item["status"], "MANUAL_DOWNLOAD_REQUIRED")
 
     async def test_crash_recovery_destination_marker_scan(self):
         """Items left in 'uploading' are marked UPLOADED if [src chat/msg] is found in destination."""
