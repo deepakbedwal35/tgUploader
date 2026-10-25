@@ -1,0 +1,91 @@
+# Render Infrastructure Blueprint for Telegram Personal Organizer
+#
+# NOTE ON SERVICE TYPE:
+# This service is configured as type: web so the companion dashboard is publicly
+# reachable and serves the /healthz health check for Render.
+# If you wish to disable the web dashboard completely (ENABLE_DASHBOARD=false),
+# change type to: worker and remove healthCheckPath, port, and PORT env var.
+
+services:
+  - type: web
+    name: telegram-organizer
+    runtime: python
+    region: oregon
+    plan: starter  # Starter or higher required for Persistent Disk
+    numInstances: 1 # Strictly 1 instance to prevent session conflicts / locks
+    maxShutdownDelaySeconds: 60 # Graceful finish of in-flight transfers on shutdown
+
+    # Pinned build & start commands
+    buildCommand: "pip install -r requirements.txt && (pip install -r requirements-optional.txt || echo 'cryptg acceleration skipped')"
+    startCommand: "python main.py"
+    healthCheckPath: /healthz
+
+    # Persistent Storage Disk
+    disk:
+      name: data
+      mountPath: /var/data
+      sizeGB: 10
+
+    envVars:
+      # Secrets (Set manually in Render Dashboard -> Environment; never committed)
+      - key: TELEGRAM_API_ID
+        sync: false
+      - key: TELEGRAM_API_HASH
+        sync: false
+      - key: TELEGRAM_PHONE
+        sync: false
+      - key: TELEGRAM_SESSION_STRING
+        sync: false
+      - key: DASHBOARD_PASSWORD
+        sync: false
+
+      # Runtime & Python version
+      - key: PYTHON_VERSION
+        value: "3.11.11"
+
+      # Storage & Paths
+      - key: DATA_DIR
+        value: "/var/data"
+
+      # Telegram Destination & Sources
+      - key: DEST_GROUP_ID
+        value: "-1003910839448"
+      - key: DEST_GROUP_NAME
+        value: "Delta 6"
+      - key: DEST_TOPIC_NAME
+        value: "Imported Files"
+      - key: SOURCE_CHATS
+        value: "-1002671181760"
+
+      # Batch Round-Robin & Concurrency
+      - key: BATCH_SIZE
+        value: "10"
+      - key: CONCURRENCY
+        value: "2"
+      - key: MAX_RETRIES
+        value: "5"
+      - key: RETRY_BASE_DELAY
+        value: "2.0"
+      - key: UPLOAD_DELAY_SECONDS
+        value: "1.5"
+
+      # Operational Flags
+      - key: DRY_RUN
+        value: "true"
+      - key: CREATE_GROUP
+        value: "false"
+      - key: CREATE_TOPICS
+        value: "false"
+      - key: AUTO_START
+        value: "false"
+      - key: IS_PREMIUM
+        value: "false"
+
+      # Web Dashboard Configuration
+      - key: ENABLE_DASHBOARD
+        value: "true"
+      - key: PORT
+        value: "10000"
+      - key: DASHBOARD_USER
+        value: "admin"
+

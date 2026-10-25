@@ -1,0 +1,11 @@
+# Manual Downloads Mapping Example
+# If you manually download a restricted file from Telegram, place it in this folder.
+# You can either name the file with the message ID (e.g., 253_notes.pdf or msg_253.mp4)
+# OR map it here by message ID:
+#
+# <message_id>: <filename>
+#
+# Examples:
+# 253: lecture_01.pdf
+# 254: problem_set_01.pdf
+

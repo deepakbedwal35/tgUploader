@@ -1,0 +1,34 @@
+# Secrets & Local Environment
+.env
+.env.*
+*.session
+*.session-journal
+*.session_string
+
+# Locks & Databases
+*.lock
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+
+# Runtime Data & Storage
+data/
+logs/
+tmp/
+/var/data/
+
+# Manual Downloads
+manual_downloads/*
+!manual_downloads/mapping.txt.example
+
+# Python Cache & Testing
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.coverage
+htmlcov/
+.dist/
+
